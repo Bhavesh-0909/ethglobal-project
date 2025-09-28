@@ -7,6 +7,8 @@ import asyncio
 from openai import OpenAI
 from uagents import Context, Protocol, Agent
 from pydantic import BaseModel, Field
+import re
+
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
     ChatMessage,
@@ -15,11 +17,17 @@ from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec,
 )
 
+# ---------------------------
+# ASI-1 client setup
+# ---------------------------
 client = OpenAI(
     base_url='https://api.asi1.ai/v1',
-    api_key='Enter your api key here', #https://asi1.ai/dashboard/api-keys
+    api_key='sk_42c1b4efbd0a4e299e25898bdb151d29aebba1181f964cf19f225f6446f5cd60',
 )
 
+# ---------------------------
+# Swarm Communication Models
+# ---------------------------
 class ProposalAnalysisRequest(BaseModel):
     proposal_id: str = Field(..., description="Unique proposal identifier")
     proposal_text: str = Field(..., description="Full proposal text")
@@ -44,24 +52,35 @@ class ProposalAnalysisResponse(BaseModel):
     confidence_score: float = Field(..., ge=0.0, le=1.0, description="Analysis confidence")
     timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
+# ---------------------------
+# Pyth Network Integration
+# ---------------------------
 class PythDataFetcher:
+    """Handles real-time and historical data from Pyth Network"""
+    
     PRICE_FEEDS = {
         'ETH/USD': '0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace',
         'BTC/USD': '0xe62df6c8b4c85fe1d94a3b9a2bfa2f2d84e5a7a8a6f9d8e1c3b2f4a5e3d2c1b0',
         'SOL/USD': '0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed5c810b9ed72e59516c35b8d',
         'USDC/USD': '0xeaa020adb5b0b6e61df6a2c3b8e9e2e9e1b5c2e2e0f2d3c4b5a6e7d8c9b0a1f0',
     }
+    
     BASE_URL = 'https://hermes.pyth.network'
+    
     async def get_latest_prices(self, symbols: List[str]) -> Dict:
+        """Fetch latest prices for given symbols"""
         try:
             feed_ids = []
             for symbol in symbols:
                 if symbol in self.PRICE_FEEDS:
                     feed_ids.append(self.PRICE_FEEDS[symbol])
+            
             if not feed_ids:
                 return {"error": "No valid symbols provided"}
+            
             feed_ids_str = ','.join(feed_ids)
             url = f"{self.BASE_URL}/api/latest_price_feeds?ids={feed_ids_str}"
+            
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as response:
                     if response.status == 200:
@@ -71,39 +90,73 @@ class PythDataFetcher:
                         return {"error": f"HTTP {response.status}"}
         except Exception as e:
             return {"error": str(e)}
+    
     def _parse_price_data(self, raw_data: dict, symbols: List[str]) -> Dict:
+        """Parse Pyth price data into readable format"""
         parsed_data = {}
+        
         if 'parsed' in raw_data:
             for i, price_feed in enumerate(raw_data['parsed']):
                 if i < len(symbols):
                     symbol = symbols[i]
                     price_data = price_feed.get('price', {})
+                    
                     parsed_data[symbol] = {
                         'price': float(price_data.get('price', 0)) / (10 ** abs(price_data.get('expo', 0))),
                         'confidence': float(price_data.get('conf', 0)) / (10 ** abs(price_data.get('expo', 0))),
                         'timestamp': price_data.get('publish_time', 0),
                         'status': price_feed.get('status', 'unknown')
                     }
+        
         return parsed_data
 
+
+def safe_parse_json(content: str) -> dict:
+    """
+    Extract and safely parse JSON from ASI-1 output.
+    Falls back gracefully if not valid JSON.
+    """
+    try:
+        return json.loads(content)
+    except Exception:
+        # Try to extract first JSON block
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except Exception as inner_e:
+                return {"error": f"JSON parse failed: {str(inner_e)}", "raw": content}
+        return {"error": "No JSON found", "raw": content}
+
+# ---------------------------
+# Enhanced Proposal Analysis Functions
+# ---------------------------
 class ProposalAnalyzer:
     def __init__(self):
         self.pyth_fetcher = PythDataFetcher()
+    
     async def analyze_financial_impact(self, proposal_data: dict, treasury_balance: float) -> dict:
+        """Analyze financial impact using real-time market data with fallback"""
         try:
             requested_amount = proposal_data.get('requested_amount', 0)
             token_type = proposal_data.get('token_type', 'ETH')
+            
+            # Fallback prices
             fallback_prices = {
                 'ETH': 2400.0,
                 'BTC': 43000.0, 
                 'SOL': 95.0,
                 'USDC': 1.0
             }
+            
             current_price = 0
             confidence = 0.5
             data_source = "fallback"
+            
+            # Try to get real-time prices from Pyth
             try:
                 market_data = await self.pyth_fetcher.get_latest_prices([f'{token_type}/USD'])
+                
                 if 'error' not in market_data and f'{token_type}/USD' in market_data:
                     price_info = market_data[f'{token_type}/USD']
                     if price_info.get('price', 0) > 0:
@@ -112,11 +165,16 @@ class ProposalAnalyzer:
                         data_source = "pyth_live"
             except:
                 pass
+            
+            # Use fallback price if Pyth failed
             if current_price == 0:
                 current_price = fallback_prices.get(token_type, 1000.0)
                 data_source = "fallback_estimate"
+            
+            # Calculate USD value and treasury impact
             usd_value = requested_amount * current_price
             treasury_impact_percentage = (requested_amount / treasury_balance) * 100 if treasury_balance > 0 else 0
+            
             return {
                 "requested_amount": requested_amount,
                 "token_type": token_type,
@@ -131,6 +189,7 @@ class ProposalAnalyzer:
             requested_amount = proposal_data.get('requested_amount', 0)
             token_type = proposal_data.get('token_type', 'ETH')
             estimated_price = 2400.0 if token_type == 'ETH' else 1000.0
+            
             return {
                 "requested_amount": requested_amount,
                 "token_type": token_type,
@@ -141,30 +200,38 @@ class ProposalAnalyzer:
                 "data_source": "error_fallback",
                 "error": str(e)
             }
+    
     def _assess_financial_risk(self, treasury_impact: float, price_confidence: float) -> str:
+        """Assess financial risk based on treasury impact and price confidence"""
         if treasury_impact > 20 or price_confidence < 0.01:
             return "HIGH"
         elif treasury_impact > 10 or price_confidence < 0.05:
             return "MEDIUM"
         else:
             return "LOW"
+    
     async def generate_market_context(self, proposal_text: str) -> dict:
+        """Generate market context for the proposal with fallback"""
         try:
             fallback_market = {
                 'ETH/USD': {'price': 2400.0, 'confidence': 0.5, 'status': 'fallback'},
                 'BTC/USD': {'price': 43000.0, 'confidence': 0.5, 'status': 'fallback'},
                 'SOL/USD': {'price': 95.0, 'confidence': 0.5, 'status': 'fallback'}
             }
+            
             market_data = fallback_market
             data_source = "fallback_prices"
+            
             try:
                 major_tokens = ['ETH/USD', 'BTC/USD', 'SOL/USD']
                 live_data = await self.pyth_fetcher.get_latest_prices(major_tokens)
+                
                 if 'error' not in live_data and len(live_data) > 0:
                     market_data = live_data
                     data_source = "pyth_live"
             except:
                 pass
+            
             return {
                 "market_snapshot": market_data,
                 "timestamp": datetime.utcnow().isoformat(),
@@ -179,18 +246,23 @@ class ProposalAnalyzer:
                 "data_source": "error_fallback",
                 "error": str(e)
             }
+    
     def _derive_market_sentiment(self, market_data: dict) -> str:
+        """Derive basic market sentiment from price confidence levels"""
         avg_confidence = sum(
             data.get('confidence', 0) for data in market_data.values() 
             if isinstance(data, dict)
         ) / len(market_data) if market_data else 0
+        
         if avg_confidence > 0.1:
             return "STABLE"
         elif avg_confidence > 0.05:
             return "VOLATILE"
         else:
             return "HIGHLY_VOLATILE"
+    
     async def perform_comprehensive_analysis(self, request: ProposalAnalysisRequest) -> ProposalAnalysisResponse:
+        """Perform comprehensive proposal analysis"""
         try:
             proposal_data = {
                 "requested_amount": request.requested_amount,
@@ -198,31 +270,41 @@ class ProposalAnalyzer:
                 "category": request.category,
                 "recipient_address": request.recipient_address
             }
+            
+            # Get financial analysis with real-time data
             financial_analysis = await self.analyze_financial_impact(proposal_data, request.treasury_balance)
+            
+            # Get market context
             market_context = await self.generate_market_context(request.proposal_text)
+            
+            # Enhanced system prompt with market data
             system_prompt = f"""
-            You are a DAO Proposal Analysis Expert with access to real-time market data.
-            
-            Analyze this proposal and return ONLY a JSON object:
+            You are a DAO Proposal Analysis Expert.
+
+            ⚠️ VERY IMPORTANT: Only return a single valid JSON object.
+            Do not include explanations, text, or markdown.
+
+            Your JSON must exactly match this schema:
             {{
-                "compliance": boolean,
-                "violations": [list of compliance issues],
-                "reasoning_trace": "detailed analysis reasoning",
-                "technical_assessment": {{
-                    "feasibility": "HIGH|MEDIUM|LOW",
-                    "complexity": "HIGH|MEDIUM|LOW",
-                    "timeline_realistic": boolean
-                }},
-                "risk_factors": [list of identified risks],
-                "recommendations": [list of actionable recommendations],
-                "confidence_score": 0.0-1.0
+            "compliance": true/false,
+             "violations": ["..."],
+              "reasoning_trace": "string",
+              "technical_assessment": {{
+                  "feasibility": "HIGH|MEDIUM|LOW",
+                  "complexity": "HIGH|MEDIUM|LOW",
+                 "timeline_realistic": true/false
+             }},
+              "risk_factors": ["..."],
+              "recommendations": ["..."],
+             "confidence_score": 0.0-1.0
             }}
-            
+
             Market Data: {json.dumps(market_context)}
             Financial Analysis: {json.dumps(financial_analysis)}
-            
-            Consider: governance compliance, technical feasibility, market timing, financial impact.
             """
+
+            
+            # Get ASI-1 analysis
             response = client.chat.completions.create(
                 model="asi1-mini",
                 messages=[
@@ -232,7 +314,16 @@ class ProposalAnalyzer:
                 max_tokens=1536,
                 temperature=0.1
             )
-            asi_analysis = json.loads(response.choices[0].message.content)
+            
+            # Parse ASI-1 response
+            content = response.choices[0].message.content.strip()
+            asi_analysis = safe_parse_json(content)
+
+            if "error" in asi_analysis:
+                raise Exception(f"ASI-1 output error: {asi_analysis['error']} | raw: {asi_analysis.get('raw', '')}")
+
+            
+            # Combine all analyses
             return ProposalAnalysisResponse(
                 proposal_id=request.proposal_id,
                 compliance=asi_analysis.get("compliance", False),
@@ -249,7 +340,9 @@ class ProposalAnalyzer:
                 recommendations=asi_analysis.get("recommendations", []),
                 confidence_score=asi_analysis.get("confidence_score", 0.7)
             )
+            
         except Exception as e:
+            # Fallback response
             return ProposalAnalysisResponse(
                 proposal_id=request.proposal_id,
                 compliance=False,
@@ -263,16 +356,28 @@ class ProposalAnalyzer:
                 confidence_score=0.1
             )
 
+# ---------------------------
+# Agent setup
+# ---------------------------
 agent = Agent()
 chat_protocol = Protocol(spec=chat_protocol_spec)
 swarm_protocol = Protocol("ProposalAnalysisProtocol", version="1.0")
 analyzer = ProposalAnalyzer()
 
+# ---------------------------
+# Chat Protocol Handler
+# ---------------------------
 @chat_protocol.on_message(ChatMessage)
 async def handle_chat_proposal(ctx: Context, sender: str, msg: ChatMessage):
+    """Handle chat-based proposal analysis"""
+    # Acknowledge receipt
     await ctx.send(sender, ChatAcknowledgement(timestamp=datetime.now(), acknowledged_msg_id=msg.msg_id))
+    
+    # Extract message text
     message_text = "".join(item.text for item in msg.content if isinstance(item, TextContent))
+    
     try:
+        # Create analysis request
         request = ProposalAnalysisRequest(
             proposal_id=f"chat_{uuid4().hex[:8]}",
             proposal_text=message_text,
@@ -281,12 +386,20 @@ async def handle_chat_proposal(ctx: Context, sender: str, msg: ChatMessage):
             submitter="chat_user",
             category="funding"
         )
+        
+        # Perform analysis
         analysis = await analyzer.perform_comprehensive_analysis(request)
+        
+        # Build simple response
         parts = []
         parts.append("Proposal Analysis Complete:")
         parts.append("")
+        
+        # Compliance
         compliance_text = "PASS" if analysis.compliance else "FAIL"
         parts.append(f"Compliance: {compliance_text}")
+        
+        # Financial
         financial = analysis.financial_impact
         if not financial.get('error'):
             usd_val = financial.get('total_usd_value', 0)
@@ -294,20 +407,29 @@ async def handle_chat_proposal(ctx: Context, sender: str, msg: ChatMessage):
             impact = financial.get('treasury_impact_percentage', 0)
             token = financial.get('token_type', 'ETH')
             amount = financial.get('requested_amount', 0)
+            
             parts.append(f"Financial Impact: ${usd_val:,.2f} USD")
             parts.append(f"Amount: {amount} {token} at ${price:,.2f}")
             parts.append(f"Treasury Impact: {impact:.1f}%")
         else:
             parts.append("Financial Impact: Analysis failed")
+        
+        # Risk and confidence
         risk = analysis.risk_assessment.get('overall_risk', 'UNKNOWN')
         conf = analysis.confidence_score
         parts.append(f"Risk Level: {risk}")
         parts.append(f"Confidence: {conf:.2f}")
+        
+        # Data source
         source = financial.get('data_source', 'unknown')
         parts.append(f"Data Source: {source}")
+        
         response_text = "\n".join(parts)
+        
     except Exception as e:
         response_text = f"Analysis Error: {str(e)}"
+    
+    # Send response
     await ctx.send(sender, ChatMessage(
         timestamp=datetime.utcnow(),
         msg_id=uuid4(),
@@ -317,15 +439,27 @@ async def handle_chat_proposal(ctx: Context, sender: str, msg: ChatMessage):
         ]
     ))
 
+# ---------------------------
+# Swarm Protocol Handler
+# ---------------------------
 @swarm_protocol.on_message(model=ProposalAnalysisRequest, replies={ProposalAnalysisResponse})
 async def handle_swarm_analysis(ctx: Context, sender: str, msg: ProposalAnalysisRequest):
+    """Handle structured proposal analysis requests from other agents"""
     try:
         ctx.logger.info(f"Processing analysis request for proposal {msg.proposal_id}")
+        
+        # Perform comprehensive analysis
         analysis = await analyzer.perform_comprehensive_analysis(msg)
+        
         ctx.logger.info(f"Analysis complete for {msg.proposal_id}: compliance={analysis.compliance}, confidence={analysis.confidence_score:.2f}")
+        
+        # Send response back to requesting agent
         await ctx.send(sender, analysis)
+        
     except Exception as e:
         ctx.logger.error(f"Error processing analysis request: {e}")
+        
+        # Send error response
         error_response = ProposalAnalysisResponse(
             proposal_id=msg.proposal_id,
             compliance=False,
@@ -340,17 +474,27 @@ async def handle_swarm_analysis(ctx: Context, sender: str, msg: ProposalAnalysis
         )
         await ctx.send(sender, error_response)
 
+# ---------------------------
+# Chat acknowledgement handler
+# ---------------------------
 @chat_protocol.on_message(ChatAcknowledgement)
 async def handle_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
     pass
 
+# ---------------------------
+# Agent Events
+# ---------------------------
 @agent.on_event("startup")
 async def startup(ctx: Context):
+    """Agent startup event"""
     ctx.logger.info("Enhanced Proposal Analysis Agent starting up...")
     ctx.logger.info(f"Agent address: {ctx.address}")
     ctx.logger.info("Pyth Network integration ready")
     ctx.logger.info("Dual protocol support: Chat + Swarm")
 
+# ---------------------------
+# Include both protocols
+# ---------------------------
 agent.include(chat_protocol, publish_manifest=True)
 agent.include(swarm_protocol, publish_manifest=True)
 
