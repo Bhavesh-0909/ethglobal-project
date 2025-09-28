@@ -1,3 +1,5 @@
+# agentverse_voter_agent.py - Compatible with Agentverse
+
 import json
 import logging
 from datetime import datetime
@@ -6,9 +8,15 @@ from uagents import Agent, Context, Protocol
 from pydantic import BaseModel, Field
 from openai import OpenAI
 
+# ------------------------------
+# Logging Setup
+# ------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ------------------------------
+# Pydantic Models
+# ------------------------------
 class DiscussionComment(BaseModel):
     user_id: str = Field(..., description="Unique identifier for the user")
     proposal_id: str = Field(..., description="Proposal being discussed")
@@ -50,14 +58,18 @@ class CommentResponse(BaseModel):
     sentiment_score: Optional[float] = Field(default=None, ge=-1.0, le=1.0)
     error: Optional[str] = Field(default=None, description="Error message if any")
 
+# ------------------------------
+# ASI-1 Integration
+# ------------------------------
 class SentimentAnalyzer:
     def __init__(self, api_key: str):
         self.client = OpenAI(
             base_url='https://api.asi1.ai/v1',
-            api_key='Enter your api key here', #https://asi1.ai/dashboard/api-keys
+            api_key='sk_42c1b4efbd0a4e299e25898bdb151d29aebba1181f964cf19f225f6446f5cd60'
         )
     
     async def analyze_sentiment(self, comment: DiscussionComment) -> SentimentOutput:
+        """Analyze sentiment using ASI-1 API"""
         try:
             prompt = f"""
             Analyze the sentiment and influence level of this DAO proposal comment:
@@ -110,20 +122,24 @@ class SentimentAnalyzer:
                 timestamp=datetime.utcnow().isoformat()
             )
 
+# ------------------------------
+# Knowledge Graph
+# ------------------------------
 class VoterKnowledgeGraph:
     def __init__(self):
         self.kg: Dict[str, Dict] = {
-            "sentiments": {},      
-            "votes": {},           
-            "follows": {},        
-            "predictions": {},     
-            "user_influence": {},   
-            "proposal_topics": {}, 
-            "voting_patterns": {}  
+            "sentiments": {},      # (user_id, proposal_id) -> SentimentOutput
+            "votes": {},           # (user_id, proposal_id) -> vote history
+            "follows": {},         # user_id -> list of followed users
+            "predictions": {},     # (user_id, proposal_id) -> VotePrediction
+            "user_influence": {},  # user_id -> influence score
+            "proposal_topics": {}, # proposal_id -> topic/category
+            "voting_patterns": {}  # user_id -> historical voting patterns
         }
         self._initialize_sample_data()
     
     def _initialize_sample_data(self):
+        """Initialize with sample social graph data"""
         self.kg["votes"] = {
             ("alice", "prop_001"): "For",
             ("bob", "prop_001"): "Against",
@@ -143,39 +159,50 @@ class VoterKnowledgeGraph:
         }
         
         self.kg["user_influence"] = {
-            "alice": 0.8,
-            "bob": 0.6,
-            "charlie": 0.4,
-            "dave": 0.3,
-            "eve": 0.5
+            "alice": 0.8,    # High influence
+            "bob": 0.6,      # Medium influence  
+            "charlie": 0.4,  # Low influence
+            "dave": 0.3,     # Low influence
+            "eve": 0.5       # Medium influence
         }
     
     def assert_sentiment(self, sentiment: SentimentOutput):
+        """Store sentiment analysis in knowledge graph"""
         key = (sentiment.user_id, sentiment.proposal_id)
         self.kg["sentiments"][key] = sentiment
         logger.info(f"Stored sentiment for {sentiment.user_id} on {sentiment.proposal_id}")
     
     def get_user_influence(self, user_id: str) -> float:
-        return self.kg["user_influence"].get(user_id, 0.2)
+        """Get user's influence score"""
+        return self.kg["user_influence"].get(user_id, 0.2)  # Default low influence
     
     def get_historical_votes(self, user_id: str) -> List[Tuple[str, str]]:
+        """Get user's historical voting record"""
         return [(prop_id, vote) for (uid, prop_id), vote in self.kg["votes"].items() if uid == user_id]
     
     def get_social_connections(self, user_id: str) -> List[str]:
+        """Get users that this user follows"""
         return self.kg["follows"].get(user_id, [])
 
+# ------------------------------
+# Voting Predictor
+# ------------------------------
 class VotingPredictor:
     def __init__(self, kg: VoterKnowledgeGraph, sentiment_analyzer: SentimentAnalyzer):
         self.kg = kg
         self.sentiment_analyzer = sentiment_analyzer
     
     def predict_user_vote(self, user_id: str, proposal_id: str) -> VotePrediction:
+        """Predict individual user vote"""
+        # Get sentiment if available
         sentiment_key = (user_id, proposal_id)
         sentiment_data = self.kg.kg["sentiments"].get(sentiment_key)
         sentiment_score = sentiment_data.sentiment_score if sentiment_data else 0.0
         
+        # Get user influence
         user_influence = self.kg.get_user_influence(user_id)
         
+        # Analyze social network influence
         connections = self.kg.get_social_connections(user_id)
         social_influence_score = 0.0
         social_votes = []
@@ -188,8 +215,10 @@ class VotingPredictor:
                 social_influence_score += vote_weight * connection_influence * 0.3
                 social_votes.append(connection_vote)
         
+        # Combine factors
         total_score = sentiment_score * 0.6 + social_influence_score * 0.4
         
+        # Determine stance
         if total_score > 0.2:
             stance = "For"
         elif total_score < -0.2:
@@ -197,8 +226,10 @@ class VotingPredictor:
         else:
             stance = "Neutral"
         
+        # Calculate confidence
         confidence = min(abs(total_score) + user_influence * 0.2, 1.0)
         
+        # Generate reasoning
         reasoning_parts = []
         if sentiment_data:
             reasoning_parts.append(f"Sentiment: {sentiment_score:.2f}")
@@ -217,6 +248,7 @@ class VotingPredictor:
         )
     
     def calculate_voting_outcome(self, proposal_id: str, user_list: List[str]) -> ProposalResponse:
+        """Calculate overall voting outcome"""
         predictions = []
         
         for user_id in user_list:
@@ -224,6 +256,7 @@ class VotingPredictor:
             self.kg.kg["predictions"][(user_id, proposal_id)] = prediction
             predictions.append(prediction)
         
+        # Calculate weighted vote outcome
         weighted_score = 0.0
         vote_counts = {"For": 0, "Against": 0, "Neutral": 0}
         
@@ -240,6 +273,7 @@ class VotingPredictor:
             else:
                 vote_counts["Neutral"] += 1
         
+        # Determine outcome
         total_voting_power = sum(self.kg.get_user_influence(uid) for uid in user_list)
         confidence_threshold = total_voting_power * 0.1
         
@@ -250,12 +284,14 @@ class VotingPredictor:
         else:
             outcome = "Uncertain"
         
+        # Identify key influencers
         key_influencers = sorted(
             user_list, 
             key=lambda u: self.kg.get_user_influence(u), 
             reverse=True
         )[:3]
         
+        # Identify risk factors
         risk_factors = []
         if vote_counts["Neutral"] > len(user_list) * 0.3:
             risk_factors.append("High voter apathy")
@@ -275,29 +311,49 @@ class VotingPredictor:
             risk_factors=risk_factors
         )
 
+# ------------------------------
+# Global Components (for Agentverse)
+# ------------------------------
 API_KEY = "sk_42c1b4efbd0a4e299e25898bdb151d29aebba1181f964cf19f225f6446f5cd60"
 
+# Initialize components globally
 sentiment_analyzer = SentimentAnalyzer(API_KEY)
 knowledge_graph = VoterKnowledgeGraph()
 predictor = VotingPredictor(knowledge_graph, sentiment_analyzer)
 
+# ------------------------------
+# Agent Setup (Agentverse Compatible)
+# ------------------------------
 agent = Agent()
 
+# Create protocol for message handling
 voter_protocol = Protocol("VoterSentimentProtocol", version="1.0")
 
+# ------------------------------
+# Message Handlers
+# ------------------------------
 @voter_protocol.on_message(model=DiscussionComment, replies={CommentResponse})
 async def handle_discussion_comment(ctx: Context, sender: str, msg: DiscussionComment):
+    """Handle incoming discussion comments"""
     try:
         ctx.logger.info(f"Processing comment from {msg.user_id} on proposal {msg.proposal_id}")
+        
+        # Analyze sentiment
         sentiment = await sentiment_analyzer.analyze_sentiment(msg)
+        
+        # Store in knowledge graph
         knowledge_graph.assert_sentiment(sentiment)
+        
+        # Send success response
         response = CommentResponse(
             status="processed",
             user_id=msg.user_id,
             sentiment_score=sentiment.sentiment_score
         )
+        
         await ctx.send(sender, response)
         ctx.logger.info(f"Successfully processed comment with sentiment score: {sentiment.sentiment_score}")
+        
     except Exception as e:
         ctx.logger.error(f"Error processing comment: {e}")
         error_response = CommentResponse(
@@ -309,12 +365,19 @@ async def handle_discussion_comment(ctx: Context, sender: str, msg: DiscussionCo
 
 @voter_protocol.on_message(model=ProposalRequest, replies={ProposalResponse})
 async def handle_proposal_request(ctx: Context, sender: str, msg: ProposalRequest):
+    """Handle proposal voting prediction requests"""
     try:
         ctx.logger.info(f"Processing proposal prediction for {msg.proposal_id} with {len(msg.user_list)} users")
+        
+        # Calculate voting outcome
         result = predictor.calculate_voting_outcome(msg.proposal_id, msg.user_list)
+        
         ctx.logger.info(f"Prediction: {result.prediction} (confidence: {result.confidence:.2f})")
         ctx.logger.info(f"Vote breakdown: {result.vote_breakdown}")
+        
+        # Send result
         await ctx.send(sender, result)
+        
     except Exception as e:
         ctx.logger.error(f"Error processing proposal request: {e}")
         error_response = ProposalResponse(
@@ -327,8 +390,12 @@ async def handle_proposal_request(ctx: Context, sender: str, msg: ProposalReques
         )
         await ctx.send(sender, error_response)
 
+# ------------------------------
+# Agent Events (Agentverse Compatible)
+# ------------------------------
 @agent.on_event("startup")
 async def startup(ctx: Context):
+    """Agent startup event"""
     ctx.logger.info(f"Voter Sentiment Agent starting up...")
     ctx.logger.info(f"Agent address: {ctx.address}")
     ctx.logger.info("Knowledge graph initialized with sample data")
@@ -336,9 +403,16 @@ async def startup(ctx: Context):
 
 @agent.on_event("shutdown")
 async def shutdown(ctx: Context):
+    """Agent shutdown event"""
     ctx.logger.info("Voter Sentiment Agent shutting down...")
 
+# ------------------------------
+# Include Protocol
+# ------------------------------
 agent.include(voter_protocol, publish_manifest=True)
 
+# ------------------------------
+# Agentverse Entry Point
+# ------------------------------
 if __name__ == "__main__":
     agent.run()
